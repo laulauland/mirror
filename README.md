@@ -1,3 +1,13 @@
+---
+drift:
+  files:
+    - src/main.zig#Config
+    - src/main.zig#main
+    - src/main.zig#runSync
+    - src/main.zig#scanMarkdownFiles
+    - src/main.zig#createSymlink
+---
+
 # mirror
 
 Maintains a directory of symlinks to `.md` files from selected source directories. Open the output directory as an Obsidian vault or in any editor — edits go straight to the real files.
