@@ -24,33 +24,106 @@ const Config = struct {
 // ---------------------------------------------------------------------------
 
 const GitignoreRules = struct {
-    patterns: std.ArrayListUnmanaged([]const u8) = .empty,
+    patterns: std.ArrayListUnmanaged(Pattern) = .empty,
     allocator: Allocator,
+
+    const Pattern = struct {
+        text: []const u8,
+        negated: bool,
+        directory_only: bool,
+        anchored: bool, // contains '/' in the middle (not just trailing)
+    };
 
     fn init(allocator: Allocator) GitignoreRules {
         return .{ .allocator = allocator };
     }
 
     fn deinit(self: *GitignoreRules) void {
+        for (self.patterns.items) |p| self.allocator.free(p.text);
         self.patterns.deinit(self.allocator);
     }
 
     /// Load .gitignore from the given directory path. Silently succeeds if no
     /// .gitignore exists.
     fn load(self: *GitignoreRules, directory_path: []const u8) !void {
-        // TODO: Open directory_path/.gitignore, parse each non-comment non-empty
-        // line as a pattern, append to self.patterns. Handle negation patterns
-        // (lines starting with '!') and directory-only patterns (trailing '/').
-        _ = self;
-        _ = directory_path;
+        const gitignore_path = try fs.path.join(self.allocator, &.{ directory_path, ".gitignore" });
+        defer self.allocator.free(gitignore_path);
+
+        const file = fs.openFileAbsolute(gitignore_path, .{}) catch return;
+        defer file.close();
+
+        const content = file.readToEndAlloc(self.allocator, 1024 * 1024) catch return;
+        defer self.allocator.free(content);
+
+        var line_iter = mem.splitScalar(u8, content, '\n');
+        while (line_iter.next()) |raw_line| {
+            var line = mem.trim(u8, raw_line, &.{ ' ', '\t', '\r' });
+            if (line.len == 0 or line[0] == '#') continue;
+
+            var negated = false;
+            if (line[0] == '!') {
+                negated = true;
+                line = line[1..];
+                if (line.len == 0) continue;
+            }
+
+            // Strip leading '/' (anchors to root but we handle that via anchored flag)
+            var anchored = false;
+            if (line[0] == '/') {
+                anchored = true;
+                line = line[1..];
+            }
+
+            var directory_only = false;
+            if (line.len > 0 and line[line.len - 1] == '/') {
+                directory_only = true;
+                line = line[0 .. line.len - 1];
+            }
+
+            if (line.len == 0) continue;
+
+            // If pattern contains '/' it's anchored to the path structure
+            if (!anchored and mem.indexOfScalar(u8, line, '/') != null) {
+                anchored = true;
+            }
+
+            try self.patterns.append(self.allocator, .{
+                .text = try self.allocator.dupe(u8, line),
+                .negated = negated,
+                .directory_only = directory_only,
+                .anchored = anchored,
+            });
+        }
     }
 
     fn isIgnored(self: *const GitignoreRules, relative_path: []const u8) bool {
-        // TODO: Check relative_path against all loaded patterns.
-        // Return true if the path matches any non-negated pattern.
-        _ = self;
-        _ = relative_path;
-        return false;
+        var ignored = false;
+        for (self.patterns.items) |pattern| {
+            // directory_only patterns only match directories, but during file scan
+            // we check path components, so we match against parent segments too
+            if (pattern.directory_only) {
+                // Check if any path component matches
+                var component_iter = mem.splitScalar(u8, relative_path, '/');
+                while (component_iter.next()) |component| {
+                    if (matchGlob(pattern.text, component)) {
+                        ignored = !pattern.negated;
+                        break;
+                    }
+                }
+            } else if (pattern.anchored) {
+                // Match against the full relative path
+                if (matchGlob(pattern.text, relative_path)) {
+                    ignored = !pattern.negated;
+                }
+            } else {
+                // Unanchored: match against basename or full path
+                const basename = fs.path.basename(relative_path);
+                if (matchGlob(pattern.text, basename) or matchGlob(pattern.text, relative_path)) {
+                    ignored = !pattern.negated;
+                }
+            }
+        }
+        return ignored;
     }
 };
 
@@ -61,14 +134,71 @@ const GitignoreRules = struct {
 /// Match a glob pattern against a path. Supports '*' (any chars except '/'),
 /// '**' (any chars including '/'), and '?' (single char).
 fn matchGlob(pattern: []const u8, path: []const u8) bool {
-    // TODO: Implement glob matching with support for:
-    //   '*'  — matches any sequence of non-'/' characters
-    //   '**' — matches any sequence of characters including '/'
-    //   '?'  — matches exactly one character
-    // Use a two-pointer or recursive approach.
-    _ = pattern;
-    _ = path;
-    return false;
+    return matchGlobInner(pattern, path, 0);
+}
+
+fn matchGlobInner(pattern: []const u8, path: []const u8, depth: usize) bool {
+    if (depth > 100) return false; // guard against degenerate patterns
+
+    var pi: usize = 0;
+    var si: usize = 0;
+
+    // For backtracking on single '*'
+    var star_pi: ?usize = null;
+    var star_si: usize = 0;
+
+    while (si < path.len or pi < pattern.len) {
+        if (pi < pattern.len) {
+            // Check for '**'
+            if (pi + 1 < pattern.len and pattern[pi] == '*' and pattern[pi + 1] == '*') {
+                // Skip the '**' and optional following '/'
+                var rest = pattern[pi + 2 ..];
+                if (rest.len > 0 and rest[0] == '/') rest = rest[1..];
+
+                // '**' matches zero or more path segments
+                var s = si;
+                while (s <= path.len) : (s += 1) {
+                    if (matchGlobInner(rest, path[s..], depth + 1)) return true;
+                }
+                return false;
+            }
+
+            if (pattern[pi] == '?') {
+                if (si < path.len and path[si] != '/') {
+                    pi += 1;
+                    si += 1;
+                    continue;
+                }
+            } else if (pattern[pi] == '*') {
+                star_pi = pi;
+                star_si = si;
+                pi += 1;
+                continue;
+            } else if (si < path.len and pattern[pi] == path[si]) {
+                pi += 1;
+                si += 1;
+                continue;
+            }
+        }
+
+        // Mismatch — backtrack to last '*' if possible
+        if (star_pi) |sp| {
+            star_si += 1;
+            if (star_si <= path.len and (star_si == path.len or path[star_si - 1] != '/')) {
+                pi = sp + 1;
+                si = star_si;
+                continue;
+            }
+            // '*' can't cross '/' boundaries
+            if (star_si <= path.len and path[star_si - 1] == '/') {
+                return false;
+            }
+        }
+
+        return false;
+    }
+
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -100,6 +230,8 @@ pub fn main() !void {
         try runDaemonStart(allocator);
     } else if (mem.eql(u8, command, "down")) {
         try runDaemonStop(allocator);
+    } else if (mem.eql(u8, command, "add") or mem.eql(u8, command, "remove")) {
+        try runModifyDirectories(allocator, args[2..]);
     } else if (mem.eql(u8, command, "help")) {
         printUsage();
     } else {
@@ -113,12 +245,14 @@ fn printUsage() void {
         \\Usage: mirror <command>
         \\
         \\Commands:
-        \\  init    Interactive setup — pick output dir and source directories
-        \\  sync    One-shot scan: create/remove symlinks based on config
-        \\  watch   Foreground FSEvents watcher (both directions)
-        \\  up      Start watcher as a background daemon
-        \\  down    Stop the background daemon
-        \\  help    Show this message
+        \\  init           Interactive setup — pick output dir and source directories
+        \\  sync           One-shot scan: create/remove symlinks based on config
+        \\  add [dir]...   Toggle directories (interactive picker or explicit args)
+        \\  remove [dir].. Alias for add
+        \\  watch          Foreground FSEvents watcher (both directions)
+        \\  up             Start watcher as a background daemon
+        \\  down           Stop the background daemon
+        \\  help           Show this message
         \\
     ;
     std.debug.print("{s}", .{usage});
@@ -173,25 +307,49 @@ fn runInit(allocator: Allocator) !void {
         return;
     }
 
-    // TODO: Interactive TUI for directory selection.
-    // Switch terminal to raw mode via posix.tcgetattr / posix.tcsetattr.
-    // Display numbered list with [x]/[ ] checkboxes.
-    // Handle key input: arrow up/down to move cursor, space to toggle, enter to confirm.
-    // Use ANSI escape codes for cursor movement and clearing lines.
-    // For now, select all directories as a placeholder.
-    const selected = try allocator.alloc(bool, directory_entries.items.len);
-    defer allocator.free(selected);
-    @memset(selected, true);
-
-    std.debug.print("Directories to mirror (all selected by default):\n", .{});
-    for (directory_entries.items, 0..) |entry, index| {
-        const marker: u8 = if (selected[index]) 'x' else ' ';
-        std.debug.print("  [{c}] {s}\n", .{ marker, entry.name });
+    // Check if stdin is a TTY for interactive mode
+    if (!posix.isatty(posix.STDIN_FILENO)) {
+        // TODO: Support flag-driven mode (--root, --directories, --output)
+        std.debug.print("Error: stdin is not a terminal and no flags provided.\n", .{});
+        std.debug.print("Run 'mirror init' from an interactive terminal, or use flags (not yet implemented).\n", .{});
+        return;
     }
 
-    // TODO: Prompt for output directory name (default: _notes).
-    // Read a line from stdin, trim whitespace, use default if empty.
-    const output_directory = "_notes";
+    // Interactive directory selection
+    const selected = try allocator.alloc(bool, directory_entries.items.len);
+    defer allocator.free(selected);
+    @memset(selected, false);
+
+    const names = try allocator.alloc([]const u8, directory_entries.items.len);
+    defer allocator.free(names);
+    for (directory_entries.items, 0..) |entry, i| {
+        names[i] = entry.name;
+    }
+
+    runInitCheckboxSelector(names, selected) catch |err| {
+        std.debug.print("Terminal error during directory selection: {}\n", .{err});
+        return;
+    };
+
+    // Check if any directories were selected
+    var any_selected = false;
+    for (selected) |s| {
+        if (s) {
+            any_selected = true;
+            break;
+        }
+    }
+    if (!any_selected) {
+        std.debug.print("No directories selected. Aborting.\n", .{});
+        return;
+    }
+
+    // Text input for output directory name
+    const output_directory = runInitTextPrompt(allocator) catch |err| {
+        std.debug.print("Terminal error during text input: {}\n", .{err});
+        return;
+    };
+    defer allocator.free(output_directory);
 
     // Build config
     var selected_directories: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -203,12 +361,14 @@ fn runInit(allocator: Allocator) !void {
     }
 
     const config = Config{
-        .root = output_directory,
+        .root = cwd_path,
         .directories = selected_directories.items,
     };
 
     // Create output directory if it doesn't exist
-    fs.makeDirAbsolute(try fs.path.join(allocator, &.{ cwd_path, output_directory })) catch |err| {
+    const output_absolute = try fs.path.join(allocator, &.{ cwd_path, output_directory });
+    defer allocator.free(output_absolute);
+    fs.makeDirAbsolute(output_absolute) catch |err| {
         if (err != error.PathAlreadyExists) return err;
     };
 
@@ -217,12 +377,379 @@ fn runInit(allocator: Allocator) !void {
     defer allocator.free(config_path);
     try writeConfig(config, config_path, allocator);
 
-    std.debug.print("\nConfig written to {s}/{s}\n", .{ output_directory, config_filename });
+    // Print summary
+    std.debug.print("Mirror: {d} directories -> {s}/\n", .{ selected_directories.items.len, output_directory });
+    std.debug.print("Config written to {s}/{s}\n", .{ output_directory, config_filename });
 
     // Run initial sync
-    try runSyncWithConfig(allocator, config, cwd_path);
+    try runSyncWithConfig(allocator, config, output_absolute);
 
     std.debug.print("Initial sync complete.\n", .{});
+}
+
+/// Shared logic for add/remove: shows picker with current config state pre-selected,
+/// or applies explicit dir args. Writes updated config and syncs.
+fn runModifyDirectories(allocator: Allocator, dir_args: []const []const u8) !void {
+    const cwd_path = try std.process.getCwdAlloc(allocator);
+    defer allocator.free(cwd_path);
+
+    const config_path = findConfigFile(allocator, cwd_path) catch {
+        std.debug.print("No .mirror.json found. Run 'mirror init' first.\n", .{});
+        return;
+    };
+    defer allocator.free(config_path);
+
+    const output_directory = fs.path.dirname(config_path) orelse return;
+
+    const parsed = try readConfig(allocator, config_path);
+    defer parsed.deinit();
+    const config = parsed.value;
+
+    // Collect all subdirectories (same logic as init)
+    var directory_entries: std.ArrayListUnmanaged(DirectoryEntry) = .empty;
+    defer directory_entries.deinit(allocator);
+
+    var cwd_dir = try fs.openDirAbsolute(cwd_path, .{ .iterate = true });
+    defer cwd_dir.close();
+
+    var iterator = cwd_dir.iterate();
+    while (try iterator.next()) |entry| {
+        if (entry.kind != .directory) continue;
+        if (entry.name[0] == '.') continue;
+        if (mem.eql(u8, entry.name, "node_modules")) continue;
+        if (mem.eql(u8, entry.name, "zig-out")) continue;
+        if (mem.eql(u8, entry.name, "zig-cache")) continue;
+        // Skip the output directory itself
+        const output_basename = fs.path.basename(output_directory);
+        if (mem.eql(u8, entry.name, output_basename)) continue;
+
+        const stat = cwd_dir.statFile(entry.name) catch continue;
+        const name_copy = try allocator.dupe(u8, entry.name);
+        try directory_entries.append(allocator, .{
+            .name = name_copy,
+            .modification_time_ns = stat.mtime,
+        });
+    }
+    defer for (directory_entries.items) |entry| allocator.free(entry.name);
+
+    mem.sort(DirectoryEntry, directory_entries.items, {}, struct {
+        fn lessThan(_: void, a: DirectoryEntry, b: DirectoryEntry) bool {
+            return a.modification_time_ns > b.modification_time_ns;
+        }
+    }.lessThan);
+
+    if (directory_entries.items.len == 0) {
+        std.debug.print("No subdirectories found.\n", .{});
+        return;
+    }
+
+    const names = try allocator.alloc([]const u8, directory_entries.items.len);
+    defer allocator.free(names);
+    for (directory_entries.items, 0..) |entry, i| {
+        names[i] = entry.name;
+    }
+
+    // Pre-select directories that are already in config
+    const selected = try allocator.alloc(bool, directory_entries.items.len);
+    defer allocator.free(selected);
+    for (names, 0..) |name, i| {
+        selected[i] = false;
+        for (config.directories) |tracked| {
+            if (mem.eql(u8, name, tracked)) {
+                selected[i] = true;
+                break;
+            }
+        }
+    }
+
+    if (dir_args.len > 0) {
+        // Programmatic: apply explicit args as toggles
+        for (dir_args) |arg| {
+            for (names, 0..) |name, i| {
+                if (mem.eql(u8, name, arg)) {
+                    selected[i] = !selected[i];
+                    break;
+                }
+            }
+        }
+    } else if (posix.isatty(posix.STDIN_FILENO)) {
+        // Interactive: show picker with current state
+        runInitCheckboxSelector(names, selected) catch |err| {
+            std.debug.print("Terminal error: {}\n", .{err});
+            return;
+        };
+    } else {
+        std.debug.print("Usage: mirror add|remove <dir> [<dir>...]\n", .{});
+        return;
+    }
+
+    // Build new directory list from selections
+    var new_directories = std.ArrayListUnmanaged([]const u8).empty;
+    defer new_directories.deinit(allocator);
+    for (names, 0..) |name, i| {
+        if (selected[i]) {
+            try new_directories.append(allocator, name);
+        }
+    }
+
+    const new_config = Config{
+        .root = config.root,
+        .directories = new_directories.items,
+        .include = config.include,
+        .exclude = config.exclude,
+    };
+
+    try writeConfig(new_config, config_path, allocator);
+    std.debug.print("Updated to {d} directories. Running sync...\n", .{new_directories.items.len});
+
+    try runSyncWithConfig(allocator, new_config, output_directory);
+    std.debug.print("Sync complete.\n", .{});
+}
+
+// ---------------------------------------------------------------------------
+// Terminal helpers for runInit
+// ---------------------------------------------------------------------------
+
+const TerminalState = struct {
+    original: posix.termios,
+    handle: posix.fd_t,
+
+    fn enterRaw(handle: posix.fd_t) !TerminalState {
+        const original = try posix.tcgetattr(handle);
+        var raw = original;
+        // Disable canonical mode, echo, and signal generation
+        // Ctrl+C is handled explicitly in readKeypress
+        raw.lflag.ICANON = false;
+        raw.lflag.ECHO = false;
+        raw.lflag.ISIG = false;
+        // Read one byte at a time, no timeout
+        raw.cc[@intFromEnum(posix.V.MIN)] = 1;
+        raw.cc[@intFromEnum(posix.V.TIME)] = 0;
+        try posix.tcsetattr(handle, .NOW, raw);
+        return .{ .original = original, .handle = handle };
+    }
+
+    fn restore(self: TerminalState) void {
+        posix.tcsetattr(self.handle, .NOW, self.original) catch {};
+    }
+};
+
+const Keypress = enum { up, down, space, enter, toggle_all, backspace, escape, interrupt, char, unknown };
+
+const KeyResult = struct {
+    key: Keypress,
+    byte: u8,
+};
+
+fn writeStderr(bytes: []const u8) void {
+    _ = posix.write(posix.STDERR_FILENO, bytes) catch {};
+}
+
+fn writeStderrFmt(buf: []u8, comptime fmt: []const u8, args: anytype) void {
+    const slice = std.fmt.bufPrint(buf, fmt, args) catch return;
+    writeStderr(slice);
+}
+
+fn readKeypress() !KeyResult {
+    var buf: [1]u8 = undefined;
+    const bytes_read = try posix.read(posix.STDIN_FILENO, &buf);
+    if (bytes_read == 0) return .{ .key = .unknown, .byte = 0 };
+
+    const byte = buf[0];
+
+    if (byte == '\x1b') {
+        // Escape sequence -- try to read '[' and the direction byte
+        var seq: [2]u8 = undefined;
+        const seq_read = posix.read(posix.STDIN_FILENO, &seq) catch return .{ .key = .escape, .byte = 0 };
+        if (seq_read == 2 and seq[0] == '[') {
+            return switch (seq[1]) {
+                'A' => .{ .key = .up, .byte = 0 },
+                'B' => .{ .key = .down, .byte = 0 },
+                else => .{ .key = .unknown, .byte = 0 },
+            };
+        }
+        return .{ .key = .escape, .byte = 0 };
+    }
+
+    return switch (byte) {
+        3, 4 => .{ .key = .interrupt, .byte = 0 }, // Ctrl+C, Ctrl+D
+        ' ' => .{ .key = .space, .byte = ' ' },
+        '\r', '\n' => .{ .key = .enter, .byte = byte },
+        'a', 'A' => .{ .key = .toggle_all, .byte = byte },
+        127, '\x08' => .{ .key = .backspace, .byte = byte },
+        else => .{ .key = .char, .byte = byte },
+    };
+}
+
+fn getTerminalHeight() usize {
+    var winsize: posix.winsize = .{ .col = 0, .row = 0, .xpixel = 0, .ypixel = 0 };
+    const rc = posix.system.ioctl(posix.STDERR_FILENO, posix.T.IOCGWINSZ, @intFromPtr(&winsize));
+    if (rc == 0 and winsize.row > 0) return winsize.row;
+    return 24; // fallback
+}
+
+fn runInitCheckboxSelector(names: []const []const u8, selected: []bool) !void {
+    const terminal = try TerminalState.enterRaw(posix.STDIN_FILENO);
+    defer terminal.restore();
+
+    var cursor: usize = 0;
+    var scroll_offset: usize = 0;
+    var fmt_buf: [256]u8 = undefined;
+
+    // Viewport: header + footer + padding = 4 lines reserved
+    const term_height = getTerminalHeight();
+    const max_visible = if (term_height > 6) term_height - 4 else 4;
+    const visible_count = @min(names.len, max_visible);
+    // header + visible entries + footer (scroll hint)
+    const render_lines = visible_count + 2;
+
+    writeStderr("\x1b[?25l");
+    defer writeStderr("\x1b[?25h");
+
+    var first_render = true;
+
+    while (true) {
+        if (!first_render) {
+            writeStderrFmt(&fmt_buf, "\x1b[{d}A", .{render_lines});
+        }
+        first_render = false;
+
+        // Header
+        var selected_count: usize = 0;
+        for (selected) |s| {
+            if (s) selected_count += 1;
+        }
+        writeStderr("\x1b[2K\r");
+        writeStderrFmt(&fmt_buf, "\x1b[1mSelect directories ({d}/{d} selected, space=toggle, a=all, enter=confirm):\x1b[0m\n", .{ selected_count, names.len });
+
+        // Visible slice
+        for (0..visible_count) |vi| {
+            const i = scroll_offset + vi;
+            writeStderr("\x1b[2K\r");
+
+            if (i == cursor) {
+                writeStderr("\x1b[7m");
+            } else if (!selected[i]) {
+                writeStderr("\x1b[2m");
+            }
+
+            const marker: u8 = if (selected[i]) 'x' else ' ';
+            writeStderrFmt(&fmt_buf, "  [{c}] {s}", .{ marker, names[i] });
+            writeStderr("\x1b[0m\n");
+        }
+
+        // Footer with scroll position
+        writeStderr("\x1b[2K\r\x1b[2m");
+        if (names.len > visible_count) {
+            const at_top = scroll_offset == 0;
+            const at_bottom = scroll_offset + visible_count >= names.len;
+            if (at_top) {
+                writeStderr("  ↓ more below");
+            } else if (at_bottom) {
+                writeStderr("  ↑ more above");
+            } else {
+                writeStderr("  ↑↓ scroll for more");
+            }
+        }
+        writeStderr("\x1b[0m\n");
+
+        const result = try readKeypress();
+        switch (result.key) {
+            .up => {
+                if (cursor > 0) {
+                    cursor -= 1;
+                    if (cursor < scroll_offset) scroll_offset = cursor;
+                }
+            },
+            .down => {
+                if (cursor < names.len - 1) {
+                    cursor += 1;
+                    if (cursor >= scroll_offset + visible_count) scroll_offset = cursor - visible_count + 1;
+                }
+            },
+            .space => {
+                selected[cursor] = !selected[cursor];
+            },
+            .toggle_all => {
+                var all_selected = true;
+                for (selected) |s| {
+                    if (!s) {
+                        all_selected = false;
+                        break;
+                    }
+                }
+                @memset(selected, !all_selected);
+            },
+            .enter => {
+                clearLines(&fmt_buf, render_lines);
+                return;
+            },
+            .escape, .interrupt => {
+                @memset(selected, false);
+                clearLines(&fmt_buf, render_lines);
+                return;
+            },
+            else => {},
+        }
+    }
+}
+
+fn clearLines(fmt_buf: []u8, line_count: usize) void {
+    writeStderrFmt(fmt_buf, "\x1b[{d}A", .{line_count});
+    for (0..line_count) |_| {
+        writeStderr("\x1b[2K\n");
+    }
+    writeStderrFmt(fmt_buf, "\x1b[{d}A", .{line_count});
+}
+
+fn runInitTextPrompt(allocator: Allocator) ![]const u8 {
+    const terminal = try TerminalState.enterRaw(posix.STDIN_FILENO);
+    defer terminal.restore();
+
+    const default_name = "_notes";
+    var fmt_buf: [512]u8 = undefined;
+
+    var input: [256]u8 = undefined;
+    var length: usize = 0;
+
+    // Show cursor for text input
+    writeStderr("\x1b[?25h");
+
+    while (true) {
+        // Render prompt
+        writeStderr("\x1b[2K\r");
+        if (length == 0) {
+            writeStderrFmt(&fmt_buf, "Output directory [\x1b[2m{s}\x1b[0m]: ", .{default_name});
+        } else {
+            writeStderrFmt(&fmt_buf, "Output directory: {s}", .{input[0..length]});
+        }
+
+        const result = try readKeypress();
+        switch (result.key) {
+            .enter => {
+                writeStderr("\n");
+                if (length == 0) {
+                    return try allocator.dupe(u8, default_name);
+                }
+                return try allocator.dupe(u8, input[0..length]);
+            },
+            .backspace => {
+                if (length > 0) length -= 1;
+            },
+            .escape, .interrupt => {
+                writeStderr("\n");
+                return try allocator.dupe(u8, default_name);
+            },
+            .char, .toggle_all => {
+                // toggle_all is 'a'/'A' -- in text prompt context, treat as regular char
+                if (length < input.len) {
+                    input[length] = result.byte;
+                    length += 1;
+                }
+            },
+            else => {},
+        }
+    }
 }
 
 const DirectoryEntry = struct {
@@ -243,12 +770,18 @@ fn runSync(allocator: Allocator) !void {
     defer parsed_config.deinit();
     const config = parsed_config.value;
 
-    try runSyncWithConfig(allocator, config, cwd_path);
+    // Output directory is the parent of the config file
+    const output_directory = fs.path.dirname(config_path) orelse {
+        std.debug.print("Error: cannot determine output directory from config path.\n", .{});
+        return;
+    };
+
+    try runSyncWithConfig(allocator, config, output_directory);
 }
 
-fn runSyncWithConfig(allocator: Allocator, config: Config, cwd_path: []const u8) !void {
-    const output_directory = try fs.path.join(allocator, &.{ cwd_path, config.root });
-    defer allocator.free(output_directory);
+fn runSyncWithConfig(allocator: Allocator, config: Config, output_directory: []const u8) !void {
+    // Derive the output directory basename for the skip list
+    const output_basename = fs.path.basename(output_directory);
 
     // Phase 1: Scan source directories and create symlinks for .md files
     var gitignore_rules = GitignoreRules.init(allocator);
@@ -256,12 +789,12 @@ fn runSyncWithConfig(allocator: Allocator, config: Config, cwd_path: []const u8)
 
     const markdown_files = try scanMarkdownFiles(
         allocator,
-        cwd_path,
+        config.root,
         config.directories,
         &gitignore_rules,
         config.include,
         config.exclude,
-        config.root,
+        output_basename,
     );
     defer {
         for (markdown_files) |path| allocator.free(path);
@@ -270,7 +803,7 @@ fn runSyncWithConfig(allocator: Allocator, config: Config, cwd_path: []const u8)
 
     var created_count: usize = 0;
     for (markdown_files) |relative_path| {
-        const did_create = try createSymlink(cwd_path, output_directory, relative_path, allocator);
+        const did_create = try createSymlink(config.root, output_directory, relative_path, allocator);
         if (did_create) created_count += 1;
     }
 
@@ -301,8 +834,13 @@ fn runWatch(allocator: Allocator) !void {
     defer parsed_config.deinit();
     const config = parsed_config.value;
 
+    const output_directory = fs.path.dirname(config_path) orelse {
+        std.debug.print("Error: cannot determine output directory from config path.\n", .{});
+        return;
+    };
+
     // Initial sync before starting watch
-    try runSyncWithConfig(allocator, config, cwd_path);
+    try runSyncWithConfig(allocator, config, output_directory);
 
     std.debug.print("Watching for changes... (press Ctrl+C to stop)\n", .{});
 
@@ -355,9 +893,13 @@ fn runDaemonStart(allocator: Allocator) !void {
 
     const parsed_config = try readConfig(allocator, config_path);
     defer parsed_config.deinit();
-    const config = parsed_config.value;
 
-    const pid_path = try fs.path.join(allocator, &.{ cwd_path, config.root, pid_filename });
+    const output_directory = fs.path.dirname(config_path) orelse {
+        std.debug.print("Error: cannot determine output directory from config path.\n", .{});
+        return;
+    };
+
+    const pid_path = try fs.path.join(allocator, &.{ output_directory, pid_filename });
     defer allocator.free(pid_path);
 
     // Check if already running
@@ -398,11 +940,12 @@ fn runDaemonStop(allocator: Allocator) !void {
     const config_path = try findConfigFile(allocator, cwd_path);
     defer allocator.free(config_path);
 
-    const parsed_config = try readConfig(allocator, config_path);
-    defer parsed_config.deinit();
-    const config = parsed_config.value;
+    const output_directory = fs.path.dirname(config_path) orelse {
+        std.debug.print("Error: cannot determine output directory from config path.\n", .{});
+        return;
+    };
 
-    const pid_path = try fs.path.join(allocator, &.{ cwd_path, config.root, pid_filename });
+    const pid_path = try fs.path.join(allocator, &.{ output_directory, pid_filename });
     defer allocator.free(pid_path);
 
     const pid_file = fs.openFileAbsolute(pid_path, .{}) catch {
@@ -538,6 +1081,9 @@ fn scanMarkdownFiles(
         while (key_iterator.next()) |key| allocator.free(key.*);
         visited_paths.deinit(allocator);
     }
+
+    // Load root .gitignore first
+    try gitignore_rules.load(root);
 
     const skip_names: []const []const u8 = &.{ ".git", output_directory_name };
 
@@ -916,9 +1462,30 @@ fn loadCoreServices() !struct { lib: std.DynLib, symbols: ResolvedSymbols } {
 // Tests
 // ---------------------------------------------------------------------------
 
-test "matchGlob placeholder" {
-    // TODO: Add tests once matchGlob is implemented
-    try std.testing.expect(!matchGlob("*.md", "foo.md"));
+test "matchGlob" {
+    // Basename matching
+    try std.testing.expect(matchGlob("*.md", "foo.md"));
+    try std.testing.expect(matchGlob("*.md", "README.md"));
+    try std.testing.expect(!matchGlob("*.md", "foo.txt"));
+    try std.testing.expect(!matchGlob("*.md", "dir/foo.md")); // '*' doesn't cross '/'
+
+    // '?' matches single char
+    try std.testing.expect(matchGlob("?.md", "a.md"));
+    try std.testing.expect(!matchGlob("?.md", "ab.md"));
+
+    // '**' matches across directories
+    try std.testing.expect(matchGlob("**/*.md", "dir/foo.md"));
+    try std.testing.expect(matchGlob("**/*.md", "a/b/c.md"));
+    try std.testing.expect(matchGlob("**/node_modules", "src/node_modules"));
+    try std.testing.expect(matchGlob("**/node_modules", "node_modules"));
+
+    // Exact match
+    try std.testing.expect(matchGlob("node_modules", "node_modules"));
+    try std.testing.expect(!matchGlob("node_modules", "node_modules2"));
+
+    // Directory patterns
+    try std.testing.expect(matchGlob("dist/*", "dist/foo"));
+    try std.testing.expect(!matchGlob("dist/*", "dist/sub/foo"));
 }
 
 test "config round-trip" {
@@ -933,7 +1500,7 @@ test "config round-trip" {
     defer allocator.free(config_path);
 
     const original = Config{
-        .root = "_notes",
+        .root = "/Users/test/Code/work",
         .directories = &.{ "src", "docs" },
     };
 
@@ -943,7 +1510,7 @@ test "config round-trip" {
     defer parsed_loaded.deinit();
     const loaded = parsed_loaded.value;
 
-    try std.testing.expectEqualStrings("_notes", loaded.root);
+    try std.testing.expectEqualStrings("/Users/test/Code/work", loaded.root);
     try std.testing.expectEqual(@as(usize, 2), loaded.directories.len);
     try std.testing.expectEqualStrings("src", loaded.directories[0]);
     try std.testing.expectEqualStrings("docs", loaded.directories[1]);
@@ -961,7 +1528,7 @@ test "config round-trip with include and exclude" {
     defer allocator.free(config_path);
 
     const original = Config{
-        .root = "_output",
+        .root = "/Users/test/projects",
         .directories = &.{"project_a"},
         .include = &.{"dist/generated/**/*.md"},
         .exclude = &.{"**/CHANGELOG.md"},
@@ -973,7 +1540,7 @@ test "config round-trip with include and exclude" {
     defer parsed_loaded.deinit();
     const loaded = parsed_loaded.value;
 
-    try std.testing.expectEqualStrings("_output", loaded.root);
+    try std.testing.expectEqualStrings("/Users/test/projects", loaded.root);
     try std.testing.expectEqual(@as(usize, 1), loaded.directories.len);
     try std.testing.expectEqualStrings("project_a", loaded.directories[0]);
     try std.testing.expectEqual(@as(usize, 1), loaded.include.len);
@@ -1016,14 +1583,17 @@ test "sync creates symlinks for md files" {
     const config_path = try fs.path.join(allocator, &.{ tmp_path, "_output", config_filename });
     defer allocator.free(config_path);
 
+    const output_directory = try fs.path.join(allocator, &.{ tmp_path, "_output" });
+    defer allocator.free(output_directory);
+
     const config = Config{
-        .root = "_output",
+        .root = tmp_path,
         .directories = &.{ "project_a", "project_b" },
     };
     try writeConfig(config, config_path, allocator);
 
     // Run sync
-    try runSyncWithConfig(allocator, config, tmp_path);
+    try runSyncWithConfig(allocator, config, output_directory);
 
     // Assert: _output/project_a/README.md exists and is a symlink
     var link_buffer: [fs.max_path_bytes]u8 = undefined;
@@ -1118,13 +1688,16 @@ test "sync is idempotent" {
         try f.writeAll("# Guide");
     }
 
+    const output_directory = try fs.path.join(allocator, &.{ tmp_path, "_output" });
+    defer allocator.free(output_directory);
+
     const config = Config{
-        .root = "_output",
+        .root = tmp_path,
         .directories = &.{ "project_a", "project_b" },
     };
 
     // First sync
-    try runSyncWithConfig(allocator, config, tmp_path);
+    try runSyncWithConfig(allocator, config, output_directory);
 
     // Second sync: scan to count what would be created
     var gitignore_rules = GitignoreRules.init(allocator);
@@ -1137,15 +1710,12 @@ test "sync is idempotent" {
         &gitignore_rules,
         config.include,
         config.exclude,
-        config.root,
+        "_output",
     );
     defer {
         for (markdown_files) |path| allocator.free(path);
         allocator.free(markdown_files);
     }
-
-    const output_directory = try fs.path.join(allocator, &.{ tmp_path, config.root });
-    defer allocator.free(output_directory);
 
     var created_count: usize = 0;
     for (markdown_files) |relative_path| {
