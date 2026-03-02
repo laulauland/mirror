@@ -1,12 +1,11 @@
----
-drift:
+<!-- drift:
   files:
     - src/main.zig#Config
     - src/main.zig#main
     - src/main.zig#runSync
     - src/main.zig#scanMarkdownFiles
     - src/main.zig#createSymlink
----
+-->
 
 # mirror
 
