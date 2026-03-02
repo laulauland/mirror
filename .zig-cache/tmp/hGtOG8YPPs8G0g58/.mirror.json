@@ -1,9 +1,0 @@
-{
-  "root": "_notes",
-  "directories": [
-    "src",
-    "docs"
-  ],
-  "include": [],
-  "exclude": []
-}
