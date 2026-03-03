@@ -823,9 +823,188 @@ fn runSyncWithConfig(allocator: Allocator, config: Config, output_directory: []c
     });
 }
 
-/// Foreground FSEvents watcher. Watches source directories and the output
-/// directory bidirectionally. Source .md changes create/remove symlinks.
-/// Output symlink changes propagate renames/moves/deletes back to source.
+// ---------------------------------------------------------------------------
+// FSEvents watcher — signal handling
+// ---------------------------------------------------------------------------
+
+/// Global pipe for signal-driven shutdown. The signal handler writes a byte
+/// to signal_pipe[1]; the main thread blocks reading signal_pipe[0].
+var signal_pipe: [2]posix.fd_t = .{ -1, -1 };
+
+fn signalHandler(_: c_int) callconv(.c) void {
+    if (signal_pipe[1] != -1) {
+        _ = posix.write(signal_pipe[1], &.{1}) catch {};
+    }
+}
+
+fn installSignalHandlers() !void {
+    const pipe = try posix.pipe();
+    signal_pipe = pipe;
+
+    const action = posix.Sigaction{
+        .handler = .{ .handler = signalHandler },
+        .mask = posix.sigemptyset(),
+        .flags = posix.SA.RESTART,
+    };
+    posix.sigaction(posix.SIG.INT, &action, null);
+    posix.sigaction(posix.SIG.TERM, &action, null);
+}
+
+// ---------------------------------------------------------------------------
+// FSEvents watcher — callback context and callback
+// ---------------------------------------------------------------------------
+
+const WatchContext = struct {
+    config: Config,
+    root: []const u8, // resolved real root path
+    output_directory: []const u8, // resolved real output path
+    output_basename: []const u8,
+    source_directories: []const []const u8, // resolved real paths to source dirs
+    gitignore_rules: *GitignoreRules,
+    allocator: Allocator,
+};
+
+fn fsEventsCallback(
+    _: ConstFSEventStreamRef,
+    client_callback_info: ?*anyopaque,
+    num_events: usize,
+    event_paths_raw: *anyopaque,
+    event_flags_raw: [*]const FSEventStreamEventFlags,
+    _: [*]const FSEventStreamEventId,
+) callconv(.c) void {
+    const ctx: *const WatchContext = @ptrCast(@alignCast(client_callback_info));
+    const event_paths: [*]const [*:0]const u8 = @ptrCast(@alignCast(event_paths_raw));
+    const paths = event_paths[0..num_events];
+    const flags = event_flags_raw[0..num_events];
+
+    for (paths, flags) |path_nts, event_flags| {
+        if (event_flags.history_done) continue;
+
+        const event_path = mem.span(path_nts);
+        handleSourceEvent(ctx, event_path, event_flags);
+    }
+}
+
+/// Process a single FSEvent for a source directory change.
+/// Determines the relative path, checks filters, and creates/removes symlinks.
+fn handleSourceEvent(ctx: *const WatchContext, event_path: []const u8, flags: FSEventStreamEventFlags) void {
+    // Only care about file-level events
+    if (!flags.item_is_file) return;
+
+    // Only care about .md files
+    if (!mem.endsWith(u8, event_path, ".md")) return;
+
+    // Determine which source directory this event belongs to
+    const relative_path = findRelativePath(ctx, event_path) orelse return;
+    defer ctx.allocator.free(relative_path);
+
+    // Apply gitignore rules
+    if (ctx.gitignore_rules.isIgnored(relative_path)) return;
+
+    // Apply include filter
+    if (ctx.config.include.len > 0) {
+        var matched = false;
+        for (ctx.config.include) |pattern| {
+            if (matchGlob(pattern, relative_path)) {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) return;
+    }
+
+    // Apply exclude filter
+    for (ctx.config.exclude) |pattern| {
+        if (matchGlob(pattern, relative_path)) return;
+    }
+
+    if (flags.item_removed) {
+        handleSourceRemove(ctx, relative_path);
+    } else if (flags.item_renamed) {
+        // Rename events come in pairs (old path removed, new path created).
+        // Check whether the source file exists to distinguish the two sides.
+        fs.accessAbsolute(event_path, .{}) catch {
+            // Source gone — treat as removal
+            handleSourceRemove(ctx, relative_path);
+            return;
+        };
+        // Source exists — treat as creation/modification
+        handleSourceCreateOrModify(ctx, relative_path);
+    } else if (flags.item_created or flags.item_modified or flags.item_inode_meta_mod) {
+        handleSourceCreateOrModify(ctx, relative_path);
+    }
+}
+
+/// Find which source directory the event path belongs to and return
+/// the relative path from root (e.g. "project_a/docs/readme.md").
+fn findRelativePath(ctx: *const WatchContext, event_path: []const u8) ?[]const u8 {
+    for (ctx.source_directories, ctx.config.directories) |source_abs, dir_name| {
+        // source_abs is e.g. "/Users/x/Code/project_a"
+        // event_path is e.g. "/Users/x/Code/project_a/docs/readme.md"
+        if (mem.startsWith(u8, event_path, source_abs) and
+            event_path.len > source_abs.len and
+            event_path[source_abs.len] == '/')
+        {
+            const sub_path = event_path[source_abs.len + 1 ..]; // "docs/readme.md"
+            return fs.path.join(ctx.allocator, &.{ dir_name, sub_path }) catch null;
+        }
+    }
+    return null;
+}
+
+fn handleSourceCreateOrModify(ctx: *const WatchContext, relative_path: []const u8) void {
+    const link_path = fs.path.join(ctx.allocator, &.{ ctx.output_directory, relative_path }) catch return;
+    defer ctx.allocator.free(link_path);
+
+    // Delete existing symlink first so createSymlink always recreates it
+    // (this also "touches" the symlink for modify events, forwarding the
+    // FSEvent notification to Obsidian)
+    fs.deleteFileAbsolute(link_path) catch {};
+
+    const did_create = createSymlink(
+        ctx.root,
+        ctx.output_directory,
+        relative_path,
+        ctx.allocator,
+    ) catch return;
+
+    if (did_create) {
+        std.debug.print("[watch] + {s}\n", .{relative_path});
+    } else {
+        std.debug.print("[watch] ~ {s}\n", .{relative_path});
+    }
+}
+
+fn handleSourceRemove(ctx: *const WatchContext, relative_path: []const u8) void {
+    const link_path = fs.path.join(ctx.allocator, &.{ ctx.output_directory, relative_path }) catch return;
+    defer ctx.allocator.free(link_path);
+
+    fs.deleteFileAbsolute(link_path) catch return;
+    std.debug.print("[watch] - {s}\n", .{relative_path});
+
+    // Clean up empty parent directories up to (but not including) the output root
+    cleanEmptyParents(ctx.output_directory, link_path);
+}
+
+/// Remove empty directories from `path`'s parent up to (but not including) `root`.
+fn cleanEmptyParents(root: []const u8, path: []const u8) void {
+    var current = fs.path.dirname(path);
+    while (current) |dir| {
+        if (mem.eql(u8, dir, root)) break;
+        if (dir.len <= root.len) break;
+
+        // Try to remove — will fail if not empty, which is fine
+        fs.deleteDirAbsolute(dir) catch break;
+        current = fs.path.dirname(dir);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FSEvents watcher — main entry point
+// ---------------------------------------------------------------------------
+
+/// Foreground FSEvents watcher. Watches source directories for .md file
+/// changes and creates/removes symlinks in the output directory.
 fn runWatch(allocator: Allocator) !void {
     const cwd_path = try std.process.getCwdAlloc(allocator);
     defer allocator.free(cwd_path);
@@ -845,48 +1024,114 @@ fn runWatch(allocator: Allocator) !void {
     // Initial sync before starting watch
     try runSyncWithConfig(allocator, config, output_directory);
 
+    // Load CoreServices symbols
+    const loaded = loadCoreServices() catch {
+        std.debug.print("Error: failed to load CoreServices framework.\n", .{});
+        return;
+    };
+    var lib = loaded.lib;
+    defer lib.close();
+    const symbols = loaded.symbols;
+
+    // Resolve real paths for source directories. FSEvents on macOS reports
+    // events using canonical paths (e.g. /private/tmp instead of /tmp), so
+    // we must compare against resolved paths.
+    const source_directories = try allocator.alloc([]const u8, config.directories.len);
+    defer {
+        for (source_directories) |p| allocator.free(p);
+        allocator.free(source_directories);
+    }
+    for (config.directories, 0..) |dir_name, i| {
+        const joined = try fs.path.join(allocator, &.{ config.root, dir_name });
+        defer allocator.free(joined);
+        source_directories[i] = try fs.realpathAlloc(allocator, joined);
+    }
+
+    // Also resolve root and output directory for consistent path comparison
+    const real_root = try fs.realpathAlloc(allocator, config.root);
+    defer allocator.free(real_root);
+    const real_output = try fs.realpathAlloc(allocator, output_directory);
+    defer allocator.free(real_output);
+
+    // Load gitignore rules
+    var gitignore_rules = GitignoreRules.init(allocator);
+    defer gitignore_rules.deinit();
+    gitignore_rules.load(config.root) catch {};
+    for (source_directories) |source_dir| {
+        gitignore_rules.load(source_dir) catch {};
+    }
+
+    // Build CF paths array for FSEventStream (source directories only for now)
+    const cf_paths = try allocator.alloc(?CFStringRef, config.directories.len);
+    defer {
+        for (cf_paths) |opt| {
+            if (opt) |p| symbols.CFRelease(p);
+        }
+        allocator.free(cf_paths);
+    }
+    for (source_directories, 0..) |source_dir, i| {
+        const z = try allocator.dupeZ(u8, source_dir);
+        defer allocator.free(z);
+        cf_paths[i] = symbols.CFStringCreateWithCString(null, z.ptr, .utf8);
+    }
+    const cf_paths_array = symbols.CFArrayCreate(null, @ptrCast(cf_paths.ptr), @intCast(cf_paths.len), null);
+    defer symbols.CFRelease(cf_paths_array);
+
+    // Build callback context using resolved real paths for FSEvents comparison
+    const output_basename = fs.path.basename(real_output);
+    var watch_ctx = WatchContext{
+        .config = config,
+        .root = real_root,
+        .output_directory = real_output,
+        .output_basename = output_basename,
+        .source_directories = source_directories,
+        .gitignore_rules = &gitignore_rules,
+        .allocator = allocator,
+    };
+
+    // Create FSEventStream
+    const stream_context = FSEventStreamContext{
+        .version = 0,
+        .info = @ptrCast(&watch_ctx),
+        .retain = null,
+        .release = null,
+        .copy_description = null,
+    };
+    const event_stream = symbols.FSEventStreamCreate(
+        null,
+        &fsEventsCallback,
+        &stream_context,
+        cf_paths_array,
+        .since_now,
+        0.1, // 100ms latency for batching
+        .{ .file_events = true, .watch_root = true },
+    );
+    defer symbols.FSEventStreamRelease(event_stream);
+
+    // Create dispatch queue and attach the stream
+    const queue = dispatch_queue_create("mirror-watch", .SERIAL);
+    symbols.FSEventStreamSetDispatchQueue(event_stream, queue);
+    defer symbols.FSEventStreamInvalidate(event_stream);
+
+    if (!symbols.FSEventStreamStart(event_stream)) {
+        std.debug.print("Error: failed to start FSEvent stream.\n", .{});
+        return;
+    }
+    defer symbols.FSEventStreamStop(event_stream);
+
     std.debug.print("Watching for changes... (press Ctrl+C to stop)\n", .{});
 
-    // TODO: Set up FSEvents watcher using CoreServices DynLib pattern.
-    //
-    // 1. Open CoreServices via std.DynLib:
-    //    var core_services = try std.DynLib.open(
-    //        "/System/Library/Frameworks/CoreServices.framework/CoreServices"
-    //    );
-    //
-    // 2. Resolve all symbols from ResolvedSymbols struct using inline for
-    //    over @typeInfo(ResolvedSymbols).@"struct".fields
-    //
-    // 3. Build list of paths to watch: all config.directories (absolute) +
-    //    the output directory.
-    //
-    // 4. Create CFString paths via CFStringCreateWithCString, pack into
-    //    CFArray via CFArrayCreate.
-    //
-    // 5. Create dispatch queue and semaphore:
-    //    const queue = dispatch_queue_create("mirror-watch", .SERIAL);
-    //    const semaphore = dispatch_semaphore_create(0);
-    //
-    // 6. Create FSEventStream with:
-    //    - callback that determines if event is in source or output dir,
-    //      and either creates/removes symlinks or propagates changes back
-    //    - latency ~0.1s
-    //    - flags: .{ .file_events = true, .watch_root = true }
-    //    - since_when: FSEventsGetCurrentEventId()
-    //
-    // 7. Attach stream to dispatch queue, start it.
-    //
-    // 8. Main loop: dispatch_semaphore_wait in a loop, re-sync on wake.
-    //
-    // 9. On SIGTERM/SIGINT: stop stream, invalidate, release, clean up.
+    // Install signal handlers and block until SIGINT/SIGTERM
+    try installSignalHandlers();
+    var buf: [1]u8 = undefined;
+    _ = posix.read(signal_pipe[0], &buf) catch {};
 
-    // Placeholder: block until killed by signal (Ctrl+C or SIGTERM from `mirror down`).
-    // Uses a self-pipe so this works both in foreground and as a daemon (where stdin is /dev/null).
-    const pipe = try posix.pipe();
-    defer posix.close(pipe[0]);
-    defer posix.close(pipe[1]);
-    var buffer: [1]u8 = undefined;
-    _ = posix.read(pipe[0], &buffer) catch {};
+    // Cleanup: close signal pipe
+    posix.close(signal_pipe[0]);
+    posix.close(signal_pipe[1]);
+    signal_pipe = .{ -1, -1 };
+
+    std.debug.print("\nStopping watcher.\n", .{});
 }
 
 /// Spawn `mirror watch` as a detached background daemon, write PID to
