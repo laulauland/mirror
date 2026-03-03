@@ -29,6 +29,7 @@ const GitignoreRules = struct {
 
     const Pattern = struct {
         text: []const u8,
+        prefix: []const u8, // directory name this .gitignore was loaded from ("" for root)
         negated: bool,
         directory_only: bool,
         anchored: bool, // contains '/' in the middle (not just trailing)
@@ -39,13 +40,17 @@ const GitignoreRules = struct {
     }
 
     fn deinit(self: *GitignoreRules) void {
-        for (self.patterns.items) |p| self.allocator.free(p.text);
+        for (self.patterns.items) |p| {
+            self.allocator.free(p.text);
+            if (p.prefix.len > 0) self.allocator.free(p.prefix);
+        }
         self.patterns.deinit(self.allocator);
     }
 
-    /// Load .gitignore from the given directory path. Silently succeeds if no
-    /// .gitignore exists.
-    fn load(self: *GitignoreRules, directory_path: []const u8) !void {
+    /// Load .gitignore from the given directory path. `prefix` is the directory
+    /// name relative to root (e.g. "nocturne") — anchored patterns will match
+    /// relative to this prefix. Pass "" for the root .gitignore.
+    fn load(self: *GitignoreRules, directory_path: []const u8, prefix: []const u8) !void {
         const gitignore_path = try fs.path.join(self.allocator, &.{ directory_path, ".gitignore" });
         defer self.allocator.free(gitignore_path);
 
@@ -87,8 +92,15 @@ const GitignoreRules = struct {
                 anchored = true;
             }
 
+            const duped_prefix = if (prefix.len > 0)
+                try self.allocator.dupe(u8, prefix)
+            else
+                "";
+            errdefer if (duped_prefix.len > 0) self.allocator.free(duped_prefix);
+
             try self.patterns.append(self.allocator, .{
                 .text = try self.allocator.dupe(u8, line),
+                .prefix = duped_prefix,
                 .negated = negated,
                 .directory_only = directory_only,
                 .anchored = anchored,
@@ -99,8 +111,6 @@ const GitignoreRules = struct {
     fn isIgnored(self: *const GitignoreRules, relative_path: []const u8) bool {
         var ignored = false;
         for (self.patterns.items) |pattern| {
-            // directory_only patterns only match directories, but during file scan
-            // we check path components, so we match against parent segments too
             if (pattern.directory_only) {
                 // Check if any path component matches
                 var component_iter = mem.splitScalar(u8, relative_path, '/');
@@ -111,9 +121,37 @@ const GitignoreRules = struct {
                     }
                 }
             } else if (pattern.anchored) {
-                // Match against the full relative path
-                if (matchGlob(pattern.text, relative_path)) {
-                    ignored = !pattern.negated;
+                // Strip prefix from relative_path so patterns match relative
+                // to the .gitignore's own directory
+                const local_path = if (pattern.prefix.len > 0) blk: {
+                    if (mem.startsWith(u8, relative_path, pattern.prefix) and
+                        relative_path.len > pattern.prefix.len and
+                        relative_path[pattern.prefix.len] == '/')
+                    {
+                        break :blk relative_path[pattern.prefix.len + 1 ..];
+                    }
+                    break :blk null;
+                } else relative_path;
+
+                if (local_path) |path| {
+                    // Match the full path first
+                    if (matchGlob(pattern.text, path)) {
+                        ignored = !pattern.negated;
+                    } else {
+                        // Also check parent paths — git skips entire directories
+                        // that match, so "references/*" ignores everything under
+                        // references/ because the subdirectory entries match
+                        var end: usize = 0;
+                        while (end < path.len) {
+                            if (mem.indexOfScalarPos(u8, path, end, '/')) |slash| {
+                                if (matchGlob(pattern.text, path[0..slash])) {
+                                    ignored = !pattern.negated;
+                                    break;
+                                }
+                                end = slash + 1;
+                            } else break;
+                        }
+                    }
                 }
             } else {
                 // Unanchored: match against basename or full path
@@ -1056,9 +1094,9 @@ fn runWatch(allocator: Allocator) !void {
     // Load gitignore rules
     var gitignore_rules = GitignoreRules.init(allocator);
     defer gitignore_rules.deinit();
-    gitignore_rules.load(config.root) catch {};
-    for (source_directories) |source_dir| {
-        gitignore_rules.load(source_dir) catch {};
+    gitignore_rules.load(config.root, "") catch {};
+    for (source_directories, config.directories) |source_dir, dir_name| {
+        gitignore_rules.load(source_dir, dir_name) catch {};
     }
 
     // Build CF paths array for FSEventStream (source directories only for now)
@@ -1460,7 +1498,7 @@ fn scanMarkdownFiles(
     }
 
     // Load root .gitignore first
-    try gitignore_rules.load(root);
+    try gitignore_rules.load(root, "");
 
     const skip_names: []const []const u8 = &.{ ".git", output_directory_name };
 
@@ -1472,7 +1510,7 @@ fn scanMarkdownFiles(
         const directory_path = try fs.path.join(allocator, &.{ root, directory_name });
         defer allocator.free(directory_path);
 
-        try gitignore_rules.load(directory_path);
+        try gitignore_rules.load(directory_path, directory_name);
 
         // Record the real path of the source directory itself for cycle detection
         const source_real_path = fs.realpathAlloc(allocator, directory_path) catch continue;
