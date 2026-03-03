@@ -230,6 +230,8 @@ pub fn main() !void {
         try runDaemonStart(allocator);
     } else if (mem.eql(u8, command, "down")) {
         try runDaemonStop(allocator);
+    } else if (mem.eql(u8, command, "status")) {
+        try runStatus(allocator, args[2..]);
     } else if (mem.eql(u8, command, "add") or mem.eql(u8, command, "remove")) {
         try runModifyDirectories(allocator, args[2..]);
     } else if (mem.eql(u8, command, "help")) {
@@ -252,6 +254,7 @@ fn printUsage() void {
         \\  watch          Foreground FSEvents watcher (both directions)
         \\  up             Start watcher as a background daemon
         \\  down           Stop the background daemon
+        \\  status         Show daemon liveness and config info (--json for JSON)
         \\  help           Show this message
         \\
     ;
@@ -877,9 +880,13 @@ fn runWatch(allocator: Allocator) !void {
     //
     // 9. On SIGTERM/SIGINT: stop stream, invalidate, release, clean up.
 
-    // Placeholder: block on stdin read until Ctrl+C
+    // Placeholder: block until killed by signal (Ctrl+C or SIGTERM from `mirror down`).
+    // Uses a self-pipe so this works both in foreground and as a daemon (where stdin is /dev/null).
+    const pipe = try posix.pipe();
+    defer posix.close(pipe[0]);
+    defer posix.close(pipe[1]);
     var buffer: [1]u8 = undefined;
-    _ = posix.read(posix.STDIN_FILENO, &buffer) catch {};
+    _ = posix.read(pipe[0], &buffer) catch {};
 }
 
 /// Spawn `mirror watch` as a detached background daemon, write PID to
@@ -904,32 +911,51 @@ fn runDaemonStart(allocator: Allocator) !void {
 
     // Check if already running
     if (fs.openFileAbsolute(pid_path, .{})) |file| {
-        file.close();
-        std.debug.print("Daemon appears to be already running (PID file exists at {s}).\n", .{pid_path});
-        std.debug.print("Run 'mirror down' first if it's stale.\n", .{});
-        return;
+        defer file.close();
+        var buffer: [32]u8 = undefined;
+        const bytes_read = file.readAll(&buffer) catch 0;
+        const pid_string = mem.trim(u8, buffer[0..bytes_read], &std.ascii.whitespace);
+        if (std.fmt.parseInt(posix.pid_t, pid_string, 10)) |pid| {
+            // Signal 0 checks if the process exists without sending a signal
+            if (posix.kill(pid, 0)) |_| {
+                std.debug.print("Daemon already running (PID {d}).\n", .{pid});
+                return;
+            } else |_| {
+                // Process is dead, remove stale PID file and continue
+                fs.deleteFileAbsolute(pid_path) catch {};
+            }
+        } else |_| {
+            fs.deleteFileAbsolute(pid_path) catch {};
+        }
     } else |_| {}
 
-    // TODO: Spawn `mirror watch` as a detached child process.
-    //
-    // 1. Get path to our own executable via std.fs.selfExePathAlloc or /proc/self/exe.
-    //
-    // 2. Use std.process.Child to spawn with:
-    //    - argv: &.{ self_exe_path, "watch" }
-    //    - cwd: cwd_path
-    //    - stdin/stdout/stderr: .close (or redirect to log file)
-    //
-    // 3. The child should be detached from the terminal session.
-    //    On macOS, after fork, call setsid() in the child. Since Zig's
-    //    Child API doesn't support pre-exec hooks directly, an alternative
-    //    is to use posix.fork + posix.execve manually, or accept that the
-    //    child is a direct subprocess and handle SIGHUP.
-    //
-    // 4. Write child PID to pid_path.
-    //
-    // 5. Print confirmation message.
+    const self_exe_path = try fs.selfExePathAlloc(allocator);
+    defer allocator.free(self_exe_path);
 
-    std.debug.print("TODO: daemon start not yet implemented\n", .{});
+    var child = std.process.Child.init(
+        &.{ self_exe_path, "watch" },
+        allocator,
+    );
+    child.cwd = cwd_path;
+    child.pgid = 0; // new process group, detach from terminal
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+
+    try child.spawn();
+
+    const pid = child.id;
+
+    // Write PID file
+    {
+        const pid_file = try fs.createFileAbsolute(pid_path, .{});
+        defer pid_file.close();
+        var buf: [32]u8 = undefined;
+        const pid_str = std.fmt.bufPrint(&buf, "{d}", .{pid}) catch unreachable;
+        try pid_file.writeAll(pid_str);
+    }
+
+    std.debug.print("Daemon started (PID {d}).\n", .{pid});
 }
 
 /// Read PID from .mirror.pid, send SIGTERM, wait briefly, remove PID file.
@@ -966,15 +992,121 @@ fn runDaemonStop(allocator: Allocator) !void {
     posix.kill(pid, posix.SIG.TERM) catch |err| {
         if (err == error.ProcessNotFound) {
             std.debug.print("Process {d} not found. Removing stale PID file.\n", .{pid});
-        } else {
-            std.debug.print("Failed to send SIGTERM to {d}: {}\n", .{ pid, err });
+            fs.deleteFileAbsolute(pid_path) catch {};
+            return;
         }
+        std.debug.print("Failed to send SIGTERM to {d}: {}\n", .{ pid, err });
+        return;
     };
 
     // Remove PID file
     fs.deleteFileAbsolute(pid_path) catch {};
 
     std.debug.print("Daemon stopped (PID {d}).\n", .{pid});
+}
+
+/// Show daemon liveness and config info. Supports --json flag for machine-readable output.
+fn runStatus(allocator: Allocator, args: []const []const u8) !void {
+    var json_output = false;
+    for (args) |arg| {
+        if (mem.eql(u8, arg, "--json")) {
+            json_output = true;
+        }
+    }
+
+    const cwd_path = try std.process.getCwdAlloc(allocator);
+    defer allocator.free(cwd_path);
+
+    const config_path = findConfigFile(allocator, cwd_path) catch {
+        std.debug.print("Error: no .mirror.json found.\n", .{});
+        return;
+    };
+    defer allocator.free(config_path);
+
+    const parsed_config = readConfig(allocator, config_path) catch {
+        std.debug.print("Error: failed to read config at {s}\n", .{config_path});
+        return;
+    };
+    defer parsed_config.deinit();
+    const config = parsed_config.value;
+
+    const output_directory = fs.path.dirname(config_path) orelse {
+        std.debug.print("Error: cannot determine output directory from config path.\n", .{});
+        return;
+    };
+
+    // Check daemon liveness
+    const pid_path = try fs.path.join(allocator, &.{ output_directory, pid_filename });
+    defer allocator.free(pid_path);
+
+    var daemon_running = false;
+    var daemon_pid: ?posix.pid_t = null;
+
+    if (fs.openFileAbsolute(pid_path, .{})) |pid_file| {
+        defer pid_file.close();
+        var buffer: [32]u8 = undefined;
+        const bytes_read = pid_file.readAll(&buffer) catch 0;
+        const pid_string = mem.trim(u8, buffer[0..bytes_read], &std.ascii.whitespace);
+        if (std.fmt.parseInt(posix.pid_t, pid_string, 10)) |pid| {
+            // Signal 0 checks if process exists without sending a signal
+            if (posix.kill(pid, 0)) |_| {
+                daemon_running = true;
+                daemon_pid = pid;
+            } else |_| {}
+        } else |_| {}
+    } else |_| {}
+
+    // Count symlinks
+    const symlink_count = try countSymlinks(allocator, output_directory);
+
+    if (json_output) {
+        // Build JSON output manually
+        std.debug.print("{{\"daemon\":\"{s}\"", .{if (daemon_running) "running" else "stopped"});
+        if (daemon_pid) |pid| {
+            std.debug.print(",\"pid\":{d}", .{pid});
+        } else {
+            std.debug.print(",\"pid\":null", .{});
+        }
+        std.debug.print(",\"root\":\"{s}\"", .{config.root});
+        std.debug.print(",\"output\":\"{s}\"", .{output_directory});
+        std.debug.print(",\"directories\":[", .{});
+        for (config.directories, 0..) |directory, i| {
+            if (i > 0) std.debug.print(",", .{});
+            std.debug.print("\"{s}\"", .{directory});
+        }
+        std.debug.print("],\"symlinks\":{d}}}\n", .{symlink_count});
+    } else {
+        if (daemon_running) {
+            std.debug.print("daemon: running (PID {d})\n", .{daemon_pid.?});
+        } else {
+            std.debug.print("daemon: stopped\n", .{});
+        }
+        std.debug.print("root:   {s}\n", .{config.root});
+        std.debug.print("output: {s}\n", .{output_directory});
+        std.debug.print("directories: ", .{});
+        for (config.directories, 0..) |directory, i| {
+            if (i > 0) std.debug.print(", ", .{});
+            std.debug.print("{s}", .{directory});
+        }
+        std.debug.print("\nsymlinks: {d}\n", .{symlink_count});
+    }
+}
+
+/// Walk the output directory recursively and count symlink entries.
+fn countSymlinks(allocator: Allocator, output_directory: []const u8) !usize {
+    var count: usize = 0;
+
+    var directory = fs.openDirAbsolute(output_directory, .{ .iterate = true }) catch return 0;
+    defer directory.close();
+
+    var walker = try directory.walk(allocator);
+    defer walker.deinit();
+
+    while (try walker.next()) |entry| {
+        if (entry.kind == .sym_link) count += 1;
+    }
+
+    return count;
 }
 
 // ---------------------------------------------------------------------------
