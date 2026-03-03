@@ -11,6 +11,7 @@ const Allocator = mem.Allocator;
 
 const config_filename = ".mirror.json";
 const pid_filename = ".mirror.pid";
+const registry_filename = "instances";
 
 const Config = struct {
     root: []const u8,
@@ -1238,6 +1239,8 @@ fn runDaemonStart(allocator: Allocator) !void {
         try pid_file.writeAll(pid_str);
     }
 
+    registerInstance(allocator, output_directory);
+
     std.debug.print("Daemon started (PID {d}).\n", .{pid});
 }
 
@@ -1284,11 +1287,13 @@ fn runDaemonStop(allocator: Allocator) !void {
 
     // Remove PID file
     fs.deleteFileAbsolute(pid_path) catch {};
+    unregisterInstance(allocator, output_directory);
 
     std.debug.print("Daemon stopped (PID {d}).\n", .{pid});
 }
 
 /// Show daemon liveness and config info. Supports --json flag for machine-readable output.
+/// When no local config is found, shows all registered instances.
 fn runStatus(allocator: Allocator, args: []const []const u8) !void {
     var json_output = false;
     for (args) |arg| {
@@ -1300,10 +1305,54 @@ fn runStatus(allocator: Allocator, args: []const []const u8) !void {
     const cwd_path = try std.process.getCwdAlloc(allocator);
     defer allocator.free(cwd_path);
 
-    const config_path = findConfigFile(allocator, cwd_path) catch {
-        std.debug.print("Error: no .mirror.json found.\n", .{});
+    // Try local config first
+    if (findConfigFile(allocator, cwd_path)) |config_path| {
+        defer allocator.free(config_path);
+        const output_directory = fs.path.dirname(config_path) orelse return;
+        try printInstanceStatus(allocator, output_directory, json_output);
         return;
-    };
+    } else |_| {}
+
+    // No local config — show all registered instances
+    const instances = try readRegistry(allocator);
+    defer {
+        for (instances) |e| allocator.free(e);
+        allocator.free(instances);
+    }
+
+    if (instances.len == 0) {
+        std.debug.print("No mirror instances registered.\n", .{});
+        return;
+    }
+
+    if (json_output) {
+        std.debug.print("[", .{});
+    }
+
+    var printed: usize = 0;
+    for (instances) |output_directory| {
+        // Verify the config still exists
+        const candidate = fs.path.join(allocator, &.{ output_directory, config_filename }) catch continue;
+        defer allocator.free(candidate);
+        fs.accessAbsolute(candidate, .{}) catch continue;
+
+        if (json_output) {
+            if (printed > 0) std.debug.print(",", .{});
+        } else {
+            if (printed > 0) std.debug.print("\n", .{});
+        }
+        printInstanceStatus(allocator, output_directory, json_output) catch continue;
+        printed += 1;
+    }
+
+    if (json_output) {
+        std.debug.print("]\n", .{});
+    }
+}
+
+/// Print status for a single mirror instance.
+fn printInstanceStatus(allocator: Allocator, output_directory: []const u8, json_output: bool) !void {
+    const config_path = try fs.path.join(allocator, &.{ output_directory, config_filename });
     defer allocator.free(config_path);
 
     const parsed_config = readConfig(allocator, config_path) catch {
@@ -1312,11 +1361,6 @@ fn runStatus(allocator: Allocator, args: []const []const u8) !void {
     };
     defer parsed_config.deinit();
     const config = parsed_config.value;
-
-    const output_directory = fs.path.dirname(config_path) orelse {
-        std.debug.print("Error: cannot determine output directory from config path.\n", .{});
-        return;
-    };
 
     // Check daemon liveness
     const pid_path = try fs.path.join(allocator, &.{ output_directory, pid_filename });
@@ -1331,7 +1375,6 @@ fn runStatus(allocator: Allocator, args: []const []const u8) !void {
         const bytes_read = pid_file.readAll(&buffer) catch 0;
         const pid_string = mem.trim(u8, buffer[0..bytes_read], &std.ascii.whitespace);
         if (std.fmt.parseInt(posix.pid_t, pid_string, 10)) |pid| {
-            // Signal 0 checks if process exists without sending a signal
             if (posix.kill(pid, 0)) |_| {
                 daemon_running = true;
                 daemon_pid = pid;
@@ -1339,11 +1382,9 @@ fn runStatus(allocator: Allocator, args: []const []const u8) !void {
         } else |_| {}
     } else |_| {}
 
-    // Count symlinks
     const symlink_count = try countSymlinks(allocator, output_directory);
 
     if (json_output) {
-        // Build JSON output manually
         std.debug.print("{{\"daemon\":\"{s}\"", .{if (daemon_running) "running" else "stopped"});
         if (daemon_pid) |pid| {
             std.debug.print(",\"pid\":{d}", .{pid});
@@ -1357,7 +1398,7 @@ fn runStatus(allocator: Allocator, args: []const []const u8) !void {
             if (i > 0) std.debug.print(",", .{});
             std.debug.print("\"{s}\"", .{directory});
         }
-        std.debug.print("],\"symlinks\":{d}}}\n", .{symlink_count});
+        std.debug.print("],\"symlinks\":{d}}}", .{symlink_count});
     } else {
         if (daemon_running) {
             std.debug.print("daemon: running (PID {d})\n", .{daemon_pid.?});
@@ -1450,6 +1491,110 @@ fn findConfigFile(allocator: Allocator, start_path: []const u8) ![]const u8 {
     }
 
     return error.ConfigNotFound;
+}
+
+// ---------------------------------------------------------------------------
+// Instance registry (~/.config/mirror/instances)
+// ---------------------------------------------------------------------------
+
+/// Return the path to the registry file, creating the directory if needed.
+fn registryPath(allocator: Allocator) ![]const u8 {
+    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return error.NoHome;
+    defer allocator.free(home);
+    const dir_path = try fs.path.join(allocator, &.{ home, ".config", "mirror" });
+    defer allocator.free(dir_path);
+    fs.makeDirAbsolute(dir_path) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    // Create .config first if needed
+    const config_dir = try fs.path.join(allocator, &.{ home, ".config" });
+    defer allocator.free(config_dir);
+    fs.makeDirAbsolute(config_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    fs.makeDirAbsolute(dir_path) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    return fs.path.join(allocator, &.{ dir_path, registry_filename });
+}
+
+/// Read all registered output directory paths from the registry.
+fn readRegistry(allocator: Allocator) ![]const []const u8 {
+    const path = registryPath(allocator) catch return &.{};
+    defer allocator.free(path);
+
+    const file = fs.openFileAbsolute(path, .{}) catch return &.{};
+    defer file.close();
+
+    const content = file.readToEndAlloc(allocator, 1024 * 1024) catch return &.{};
+    defer allocator.free(content);
+
+    var lines: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (lines.items) |line| allocator.free(line);
+        lines.deinit(allocator);
+    }
+
+    var iter = mem.splitScalar(u8, content, '\n');
+    while (iter.next()) |line| {
+        const trimmed = mem.trim(u8, line, &std.ascii.whitespace);
+        if (trimmed.len == 0) continue;
+        try lines.append(allocator, try allocator.dupe(u8, trimmed));
+    }
+
+    return lines.toOwnedSlice(allocator);
+}
+
+/// Add an output directory to the registry (idempotent).
+fn registerInstance(allocator: Allocator, output_directory: []const u8) void {
+    const path = registryPath(allocator) catch return;
+    defer allocator.free(path);
+
+    // Read existing entries to avoid duplicates
+    const entries = readRegistry(allocator) catch return;
+    defer {
+        for (entries) |e| allocator.free(e);
+        allocator.free(entries);
+    }
+
+    for (entries) |entry| {
+        if (mem.eql(u8, entry, output_directory)) return;
+    }
+
+    const file = fs.openFileAbsolute(path, .{ .mode = .write_only }) catch {
+        const new_file = fs.createFileAbsolute(path, .{}) catch return;
+        new_file.writeAll(output_directory) catch {};
+        new_file.writeAll("\n") catch {};
+        new_file.close();
+        return;
+    };
+    defer file.close();
+    file.seekFromEnd(0) catch return;
+    file.writeAll(output_directory) catch {};
+    file.writeAll("\n") catch {};
+}
+
+/// Remove an output directory from the registry.
+fn unregisterInstance(allocator: Allocator, output_directory: []const u8) void {
+    const path = registryPath(allocator) catch return;
+    defer allocator.free(path);
+
+    const entries = readRegistry(allocator) catch return;
+    defer {
+        for (entries) |e| allocator.free(e);
+        allocator.free(entries);
+    }
+
+    const file = fs.createFileAbsolute(path, .{}) catch return;
+    defer file.close();
+    for (entries) |entry| {
+        if (mem.eql(u8, entry, output_directory)) continue;
+        file.writeAll(entry) catch return;
+        file.writeAll("\n") catch return;
+    }
 }
 
 // ---------------------------------------------------------------------------
