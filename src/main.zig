@@ -927,20 +927,33 @@ fn fsEventsCallback(
 /// Process a single FSEvent for a source directory change.
 /// Determines the relative path, checks filters, and creates/removes symlinks.
 fn handleSourceEvent(ctx: *const WatchContext, event_path: []const u8, flags: FSEventStreamEventFlags) void {
-    // Only care about file-level events
-    if (!flags.item_is_file) return;
+    const is_removal = flags.item_removed or
+        (flags.item_renamed and !fileExists(event_path));
 
-    // Only care about .md files
+    // Directory removal: clean up all broken symlinks under the corresponding output path
+    if (!flags.item_is_file and is_removal) {
+        const relative_path = findRelativePath(ctx, event_path) orelse return;
+        defer ctx.allocator.free(relative_path);
+        handleDirectoryRemove(ctx, relative_path);
+        return;
+    }
+
+    if (!flags.item_is_file) return;
     if (!mem.endsWith(u8, event_path, ".md")) return;
 
-    // Determine which source directory this event belongs to
     const relative_path = findRelativePath(ctx, event_path) orelse return;
     defer ctx.allocator.free(relative_path);
 
-    // Apply gitignore rules
+    // For removals, skip filters — always clean up stale symlinks regardless
+    // of gitignore/include/exclude rules (the symlink may predate the filter)
+    if (is_removal) {
+        handleSourceRemove(ctx, relative_path);
+        return;
+    }
+
+    // Apply filters only for create/modify events
     if (ctx.gitignore_rules.isIgnored(relative_path)) return;
 
-    // Apply include filter
     if (ctx.config.include.len > 0) {
         var matched = false;
         for (ctx.config.include) |pattern| {
@@ -952,26 +965,18 @@ fn handleSourceEvent(ctx: *const WatchContext, event_path: []const u8, flags: FS
         if (!matched) return;
     }
 
-    // Apply exclude filter
     for (ctx.config.exclude) |pattern| {
         if (matchGlob(pattern, relative_path)) return;
     }
 
-    if (flags.item_removed) {
-        handleSourceRemove(ctx, relative_path);
-    } else if (flags.item_renamed) {
-        // Rename events come in pairs (old path removed, new path created).
-        // Check whether the source file exists to distinguish the two sides.
-        fs.accessAbsolute(event_path, .{}) catch {
-            // Source gone — treat as removal
-            handleSourceRemove(ctx, relative_path);
-            return;
-        };
-        // Source exists — treat as creation/modification
-        handleSourceCreateOrModify(ctx, relative_path);
-    } else if (flags.item_created or flags.item_modified or flags.item_inode_meta_mod) {
+    if (flags.item_created or flags.item_modified or flags.item_inode_meta_mod or flags.item_renamed) {
         handleSourceCreateOrModify(ctx, relative_path);
     }
+}
+
+fn fileExists(path: []const u8) bool {
+    fs.accessAbsolute(path, .{}) catch return false;
+    return true;
 }
 
 /// Find which source directory the event path belongs to and return
@@ -1011,6 +1016,43 @@ fn handleSourceCreateOrModify(ctx: *const WatchContext, relative_path: []const u
         std.debug.print("[watch] + {s}\n", .{relative_path});
     } else {
         std.debug.print("[watch] ~ {s}\n", .{relative_path});
+    }
+}
+
+/// Handle removal of an entire source directory. Walk the corresponding output
+/// directory and remove any broken symlinks (their targets no longer exist).
+fn handleDirectoryRemove(ctx: *const WatchContext, relative_path: []const u8) void {
+    const output_subdir = fs.path.join(ctx.allocator, &.{ ctx.output_directory, relative_path }) catch return;
+    defer ctx.allocator.free(output_subdir);
+
+    var dir = fs.openDirAbsolute(output_subdir, .{ .iterate = true }) catch return;
+    defer dir.close();
+
+    var walker = dir.walk(ctx.allocator) catch return;
+    defer walker.deinit();
+
+    var removed: usize = 0;
+    while (walker.next() catch null) |entry| {
+        if (entry.kind != .sym_link) continue;
+
+        const full_path = fs.path.join(ctx.allocator, &.{ output_subdir, entry.path }) catch continue;
+        defer ctx.allocator.free(full_path);
+
+        // Check if the symlink target still exists
+        fs.accessAbsolute(full_path, .{}) catch {
+            const entry_relative = fs.path.join(ctx.allocator, &.{ relative_path, entry.path }) catch continue;
+            defer ctx.allocator.free(entry_relative);
+
+            fs.deleteFileAbsolute(full_path) catch continue;
+            std.debug.print("[watch] - {s}\n", .{entry_relative});
+            removed += 1;
+        };
+    }
+
+    if (removed > 0) {
+        cleanEmptyParents(ctx.output_directory, output_subdir);
+        // Also try to remove the directory itself and its children
+        fs.deleteTreeAbsolute(output_subdir) catch {};
     }
 }
 
