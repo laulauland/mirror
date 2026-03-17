@@ -431,6 +431,25 @@ fn runInit(allocator: Allocator) !void {
 
 /// Shared logic for add/remove: shows picker with current config state pre-selected,
 /// or applies explicit dir args. Writes updated config and syncs.
+/// Normalize a user-provided directory argument:
+/// strip trailing '/', strip leading './', extract basename from paths.
+fn normalizeDirectoryArg(arg: []const u8) []const u8 {
+    var result = arg;
+    // Strip trailing slashes
+    while (result.len > 0 and result[result.len - 1] == '/') {
+        result = result[0 .. result.len - 1];
+    }
+    // Strip leading "./"
+    if (mem.startsWith(u8, result, "./")) {
+        result = result[2..];
+    }
+    // If it still contains '/', take the basename
+    if (mem.indexOfScalar(u8, result, '/') != null) {
+        result = fs.path.basename(result);
+    }
+    return result;
+}
+
 fn runModifyDirectories(allocator: Allocator, dir_args: []const []const u8) !void {
     const cwd_path = try std.process.getCwdAlloc(allocator);
     defer allocator.free(cwd_path);
@@ -507,11 +526,17 @@ fn runModifyDirectories(allocator: Allocator, dir_args: []const []const u8) !voi
     if (dir_args.len > 0) {
         // Programmatic: apply explicit args as toggles
         for (dir_args) |arg| {
+            const normalized = normalizeDirectoryArg(arg);
+            var matched = false;
             for (names, 0..) |name, i| {
-                if (mem.eql(u8, name, arg)) {
+                if (mem.eql(u8, name, normalized)) {
                     selected[i] = !selected[i];
+                    matched = true;
                     break;
                 }
+            }
+            if (!matched) {
+                std.debug.print("Warning: directory '{s}' not found, skipping.\n", .{normalized});
             }
         }
     } else if (posix.isatty(posix.STDIN_FILENO)) {
